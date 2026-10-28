@@ -1,0 +1,26 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test
+      - run: npm run build
+      - name: CLI smoke test
+        run: |
+          node dist-cli/cli.js scan tests/fixtures/alpha-direct.apk --fail-on error
+          # the fixtures include a debug-signed APK, so --fail-on error must exit 1
+          set +e; node dist-cli/cli.js scan tests/fixtures --fail-on error > /dev/null; code=$?; set -e
+          test "$code" -eq 1
