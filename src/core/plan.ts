@@ -1,0 +1,192 @@
+import { colonHex } from './bytes';
+import type { ArtifactReport } from './analyze';
+import type { CertInfo } from './x509';
+
+export type KeyRole = 'signing' | 'earlier-rotation' | 'upload' | 'debug';
+
+export interface PlanKey {
+  sha256: string;
+  cert: CertInfo;
+  role: KeyRole;
+  sources: string[];
+}
+
+export interface PlanPackage {
+  packageName: string;
+  versions: string[];
+  keys: PlanKey[];
+  hasProofApk: boolean;
+}
+
+export interface KeyGroup {
+  sha256: string;
+  cert: CertInfo;
+  packages: string[];
+}
+
+export interface Plan {
+  packages: PlanPackage[];
+  /** Registrable keys and every package they sign, most-shared first. */
+  keyGroups: KeyGroup[];
+  unreadable: string[];
+}
+
+const ROLE_RANK: Record<KeyRole, number> = { signing: 0, 'earlier-rotation': 1, upload: 2, debug: 3 };
+
+export const ROLE_LABEL: Record<KeyRole, string> = {
+  signing: 'App signing key',
+  'earlier-rotation': 'Earlier key (rotation lineage)',
+  upload: 'Upload key (from .aab)',
+  debug: 'Debug key — do not register',
+};
+
+export function buildPlan(reports: ArtifactReport[]): Plan {
+  const pkgs = new Map<string, PlanPackage>();
+  const unreadable: string[] = [];
+  for (const r of reports) {
+    const name = r.manifest.packageName;
+    if (!name || !r.currentCert) {
+      unreadable.push(r.fileName);
+      continue;
+    }
+    let p = pkgs.get(name);
+    if (!p) {
+      p = { packageName: name, versions: [], keys: [], hasProofApk: false };
+      pkgs.set(name, p);
+    }
+    const v = [r.manifest.versionName, r.manifest.versionCode && `(${r.manifest.versionCode})`].filter(Boolean).join(' ');
+    if (v && !p.versions.includes(v)) p.versions.push(v);
+    if (r.proofFiles.length) p.hasProofApk = true;
+
+    const addKey = (cert: CertInfo, role: KeyRole) => {
+      const existing = p!.keys.find((k) => k.sha256 === cert.sha256);
+      if (existing) {
+        if (ROLE_RANK[role] < ROLE_RANK[existing.role]) existing.role = role;
+        if (!existing.sources.includes(r.fileName)) existing.sources.push(r.fileName);
+      } else p!.keys.push({ sha256: cert.sha256, cert, role, sources: [r.fileName] });
+    };
+    const cur = r.currentCert;
+    addKey(cur, cur.isDebug ? 'debug' : r.kind === 'aab' ? 'upload' : 'signing');
+    for (const l of r.lineage) if (l.cert.sha256 !== cur.sha256) addKey(l.cert, 'earlier-rotation');
+  }
+
+  const packages = [...pkgs.values()].sort((a, b) => a.packageName.localeCompare(b.packageName));
+  for (const p of packages) p.keys.sort((a, b) => ROLE_RANK[a.role] - ROLE_RANK[b.role] || a.sha256.localeCompare(b.sha256));
+
+  const groups = new Map<string, KeyGroup>();
+  for (const p of packages) {
+    for (const k of p.keys) {
+      if (k.role === 'debug' || k.role === 'upload') continue;
+      const g = groups.get(k.sha256) ?? { sha256: k.sha256, cert: k.cert, packages: [] };
+      g.packages.push(p.packageName);
+      groups.set(k.sha256, g);
+    }
+  }
+  const keyGroups = [...groups.values()].sort((a, b) => b.packages.length - a.packages.length || a.sha256.localeCompare(b.sha256));
+  return { packages, keyGroups, unreadable };
+}
+
+function csvCell(v: string): string {
+  // Neutralise spreadsheet formula injection and quote everything.
+  const safe = /^[=+\-@\t\r]/.test(v) ? `'${v}` : v;
+  return `"${safe.replace(/"/g, '""')}"`;
+}
+
+export function planToCsv(plan: Plan): string {
+  const rows = [['package_name', 'sha256_fingerprint', 'sha256_api', 'role', 'certificate_subject', 'valid_until', 'source_files']];
+  for (const p of plan.packages) {
+    for (const k of p.keys) {
+      rows.push([p.packageName, colonHex(k.sha256), k.sha256.toLowerCase(), ROLE_LABEL[k.role], k.cert.subject, k.cert.notAfter ?? '', k.sources.join('; ')]);
+    }
+  }
+  return rows.map((r) => r.map(csvCell).join(',')).join('\r\n') + '\r\n';
+}
+
+export function planToJson(plan: Plan, generatedAt = new Date().toISOString()): string {
+  return JSON.stringify(
+    {
+      generatedAt,
+      tool: 'package-pass',
+      packages: plan.packages.map((p) => ({
+        packageName: p.packageName,
+        versions: p.versions,
+        keys: p.keys.map((k) => ({
+          certificateFingerprintSha256: k.sha256.toLowerCase(),
+          fingerprint: colonHex(k.sha256),
+          role: k.role,
+          subject: k.cert.subject,
+          notAfter: k.cert.notAfter,
+          sources: k.sources,
+        })),
+      })),
+      keyReuse: plan.keyGroups.map((g) => ({ certificateFingerprintSha256: g.sha256.toLowerCase(), subject: g.cert.subject, packages: g.packages })),
+      unreadable: plan.unreadable,
+    },
+    null,
+    2,
+  );
+}
+
+const PKG_SAFE = /^[A-Za-z0-9_.]+$/;
+
+/**
+ * Emits a reviewable bash script that walks the documented Android Developer Console API flow
+ * (registrationPolicy → CreateAndroidPackage → CreateAndroidPackageKey). Dry-run unless RUN=1.
+ */
+export function planToApiScript(plan: Plan, generatedAt = new Date().toISOString()): string {
+  const lines: string[] = [
+    '#!/usr/bin/env bash',
+    `# Generated by Package Pass on ${generatedAt}. Review every line before running.`,
+    '# API reference: https://developer.android.com/developer-verification/reference/developer-console-api',
+    '#',
+    '# Needs curl, a verified Android Developer Console account, and a user OAuth 2.0 access token',
+    '# with scope https://www.googleapis.com/auth/androiddeveloperconsole (service accounts are not supported).',
+    '#',
+    '#   export ACCESS_TOKEN=...            # never commit this',
+    '#   ./register.sh accounts             # find your DEVELOPER_ACCOUNT id',
+    '#   export DEVELOPER_ACCOUNT=1234567890',
+    '#   ./register.sh                      # dry run: prints the requests',
+    '#   RUN=1 ./register.sh                # sends them',
+    '#',
+    '# A key that comes back in state DRAFT needs proof of ownership: put its verificationToken in',
+    '# assets/adi-registration.properties, sign an APK with that key, check it in Package Pass, then upload.',
+    '# Keys already verified on another package in the same account go straight to IN_REVIEW.',
+    'set -euo pipefail',
+    'API="https://androiddeveloperconsole.googleapis.com/v1"',
+    '',
+    'call() {',
+    '  local method="$1" url="$2" body="${3:-}"',
+    '  if [ "${RUN:-0}" != "1" ]; then echo "[dry-run] $method $url $body"; return 0; fi',
+    '  local args=(-sS -X "$method" -H "Authorization: Bearer ${ACCESS_TOKEN:?set ACCESS_TOKEN}")',
+    '  if [ -n "$body" ]; then args+=(-H "Content-Type: application/json; charset=utf-8" -d "$body"); fi',
+    '  curl "${args[@]}" "$url"',
+    '  echo',
+    '}',
+    '',
+    'if [ "${1:-}" = "accounts" ]; then RUN=1 call GET "$API/developerAccounts"; exit 0; fi',
+    'ACCT="$API/developerAccounts/${DEVELOPER_ACCOUNT:?set DEVELOPER_ACCOUNT (see ./register.sh accounts)}"',
+    '',
+    'policy()      { echo "== $1: registration policy"; call GET "$ACCT/androidPackages/$1/registrationPolicy"; }',
+    'add_package() { echo "== $1: create package"; call POST "$ACCT/androidPackages?androidPackageId=$1" \'{"name": ""}\'; }',
+    'add_key()     { echo "== $1: add key $2"; call POST "$ACCT/androidPackages/$1/keys" "{\\"certificateFingerprintSha256\\": \\"$2\\"}"; }',
+    '',
+  ];
+  for (const p of plan.packages) {
+    if (!PKG_SAFE.test(p.packageName)) {
+      lines.push(`# Skipped ${JSON.stringify(p.packageName)}: package name has unexpected characters.`, '');
+      continue;
+    }
+    lines.push(`# ${p.packageName}${p.versions.length ? ` — seen versions: ${p.versions.join(', ')}` : ''}`);
+    lines.push(`policy ${p.packageName}`, `add_package ${p.packageName}`);
+    for (const k of p.keys) {
+      const fp = k.sha256.toLowerCase();
+      const subj = k.cert.subject.replace(/[\r\n]/g, ' ');
+      if (k.role === 'signing') lines.push(`add_key ${p.packageName} ${fp}   # ${subj}`);
+      else if (k.role === 'earlier-rotation') lines.push(`# add_key ${p.packageName} ${fp}   # earlier rotation key (${subj}); uncomment if old builds are still installed`);
+      else if (k.role === 'upload') lines.push(`# add_key ${p.packageName} ${fp}   # UPLOAD key from an .aab (${subj}); with Play App Signing register Google's app signing key instead`);
+      else lines.push(`# not registering ${fp}: Android debug key`);
+    }
+    lines.push('');
+  }
+  return lines.join('\n');
+}
