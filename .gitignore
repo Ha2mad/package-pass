@@ -1,0 +1,11 @@
+node_modules/
+dist/
+dist-cli/
+*.log
+.DS_Store
+# never commit signing material
+*.jks
+*.keystore
+*.p12
+*.pk8
+*.pem

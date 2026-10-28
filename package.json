@@ -1,0 +1,55 @@
+{
+  "name": "package-pass",
+  "version": "1.0.0",
+  "description": "Get your Android apps through developer verification: read package names and signing-key SHA-256 fingerprints from APK, AAB and APK sets in your browser, map keys across stores, preflight proof-of-ownership APKs and export a registration plan.",
+  "type": "module",
+  "bin": {
+    "package-pass": "dist-cli/cli.js"
+  },
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build && npm run build:cli",
+    "build:cli": "vite build --config vite.cli.config.ts",
+    "preview": "vite preview",
+    "test": "vitest run",
+    "lint": "eslint .",
+    "typecheck": "tsc",
+    "check": "npm run lint && npm test && npm run build",
+    "screenshots": "node scripts/screenshots.mjs"
+  },
+  "keywords": [
+    "android",
+    "developer-verification",
+    "apk",
+    "aab",
+    "apksigner",
+    "signing-key",
+    "sha256",
+    "fingerprint",
+    "sideloading",
+    "f-droid",
+    "preact"
+  ],
+  "author": "Ha2mad",
+  "license": "MIT",
+  "private": true,
+  "engines": {
+    "node": ">=20.19"
+  },
+  "dependencies": {
+    "fflate": "^0.8.3",
+    "preact": "^11.1.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^22.20.5",
+    "eslint": "^10.13.0",
+    "globals": "^17.13.0",
+    "jsdom": "^29.1.1",
+    "playwright": "^1.64.1",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.72.1",
+    "vite": "^8.3.5",
+    "vitest": "^5.0.5"
+  }
+}
